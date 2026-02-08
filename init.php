@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Really Simple Cache
  * Description: Super lightweight output cache with HTML/CSS/JS minification and auto-defer scripts.
- * Version: 2.1
+ * Version: 2.2
  * Author: UnicornPanel.net
  */
 
@@ -77,6 +77,9 @@ class ReallySimpleCache {
             'local_avatars' => 0,
             'local_fonts' => 0,
             'asset_ttl' => 604800,
+            'excluded_pages' => '',
+            'excluded_css' => '',
+            'excluded_js' => '',
         ];
     }
 
@@ -132,6 +135,9 @@ class ReallySimpleCache {
             'local_fonts' => empty($input['local_fonts']) ? 0 : 1,
             'cache_ttl' => isset($input['cache_ttl']) ? max(60, (int) $input['cache_ttl']) : $defaults['cache_ttl'],
             'asset_ttl' => isset($input['asset_ttl']) ? max(3600, (int) $input['asset_ttl']) : $defaults['asset_ttl'],
+            'excluded_pages' => isset($input['excluded_pages']) ? sanitize_textarea_field($input['excluded_pages']) : '',
+            'excluded_css' => isset($input['excluded_css']) ? sanitize_textarea_field($input['excluded_css']) : '',
+            'excluded_js' => isset($input['excluded_js']) ? sanitize_textarea_field($input['excluded_js']) : '',
         ];
 
         $this->settings = wp_parse_args($settings, $defaults);
@@ -175,7 +181,7 @@ class ReallySimpleCache {
                     </div>
 
                     <div class="rsc-card">
-                        <h2>Requested Features</h2>
+                        <h2>Additional Optimizations</h2>
                         <?php $this->render_toggle('combine_css', 'Combine CSS Files', 'Bundles same-domain stylesheet files into combined output.'); ?>
                         <?php $this->render_toggle('combine_js', 'Combine JS Files', 'Bundles same-domain head scripts into a combined file.'); ?>
                         <?php $this->render_toggle('local_avatars', 'Store Gravatar Avatars Locally', 'Caches Gravatar image responses in local uploads.'); ?>
@@ -184,6 +190,26 @@ class ReallySimpleCache {
                         <label class="rsc-field">
                             <span>Remote Asset TTL (seconds)</span>
                             <input type="number" min="3600" step="3600" name="rsc_settings[asset_ttl]" value="<?php echo esc_attr((int) $s['asset_ttl']); ?>" />
+                        </label>
+                    </div>
+
+                    <div class="rsc-card rsc-card--full">
+                        <h2>Exclusions</h2>
+                        <p class="rsc-help">Use one pattern per line. Wildcards are supported, for example: <code>/checkout*</code> or <code>*jquery*</code>.</p>
+
+                        <label class="rsc-field">
+                            <span>Excluded Pages (allow wildcards)</span>
+                            <textarea name="rsc_settings[excluded_pages]" rows="4" placeholder="/checkout*&#10;/my-account*"><?php echo esc_textarea((string) $s['excluded_pages']); ?></textarea>
+                        </label>
+
+                        <label class="rsc-field">
+                            <span>Excluded CSS (allow wildcards)</span>
+                            <textarea name="rsc_settings[excluded_css]" rows="4" placeholder="*/wp-content/plugins/some-plugin/*&#10;*critical.css*"><?php echo esc_textarea((string) $s['excluded_css']); ?></textarea>
+                        </label>
+
+                        <label class="rsc-field">
+                            <span>Excluded JavaScript (allow wildcards)</span>
+                            <textarea name="rsc_settings[excluded_js]" rows="4" placeholder="*gtag/js*&#10;*recaptcha*"><?php echo esc_textarea((string) $s['excluded_js']); ?></textarea>
                         </label>
                     </div>
                 </div>
@@ -211,6 +237,9 @@ class ReallySimpleCache {
             .rsc-card h2 {
                 margin-top: 0;
                 font-size: 18px;
+            }
+            .rsc-card--full {
+                grid-column: 1 / -1;
             }
             .rsc-toggle {
                 display: grid;
@@ -271,6 +300,15 @@ class ReallySimpleCache {
             .rsc-field input[type="number"] {
                 max-width: 220px;
             }
+            .rsc-field textarea {
+                width: 100%;
+                min-height: 96px;
+                font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+            }
+            .rsc-help {
+                margin: 0 0 14px;
+                color: #516170;
+            }
         </style>
         <?php
     }
@@ -318,8 +356,78 @@ class ReallySimpleCache {
         return max(3600, $this->setting_int('asset_ttl', 604800));
     }
 
+    private function get_exclusion_patterns($setting_key) {
+        $value = isset($this->settings[$setting_key]) ? (string) $this->settings[$setting_key] : '';
+        if ($value === '') {
+            return [];
+        }
+
+        $lines = preg_split('/\r\n|\r|\n/', $value);
+        if (!is_array($lines)) {
+            return [];
+        }
+
+        $patterns = [];
+        foreach ($lines as $line) {
+            $line = trim($line);
+            if ($line === '') {
+                continue;
+            }
+            $patterns[] = $line;
+        }
+
+        return $patterns;
+    }
+
+    private function wildcard_match($pattern, $subject) {
+        $regex = preg_quote($pattern, '/');
+        $regex = str_replace(['\*', '\?'], ['.*', '.'], $regex);
+        return preg_match('/^' . $regex . '$/i', (string) $subject) === 1;
+    }
+
+    private function matches_any_pattern($subject, $patterns) {
+        foreach ((array) $patterns as $pattern) {
+            if ($this->wildcard_match($pattern, $subject)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function is_current_page_excluded() {
+        $patterns = $this->get_exclusion_patterns('excluded_pages');
+        if (empty($patterns)) {
+            return false;
+        }
+
+        $uri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '/';
+        $path = wp_parse_url($uri, PHP_URL_PATH);
+        $path = is_string($path) && $path !== '' ? $path : $uri;
+
+        return $this->matches_any_pattern($uri, $patterns) || $this->matches_any_pattern($path, $patterns);
+    }
+
+    private function is_asset_excluded($url, $type) {
+        $setting = ($type === 'css') ? 'excluded_css' : 'excluded_js';
+        $patterns = $this->get_exclusion_patterns($setting);
+        if (empty($patterns)) {
+            return false;
+        }
+
+        $url = (string) $url;
+        $parsed_path = wp_parse_url($url, PHP_URL_PATH);
+        $path = is_string($parsed_path) ? $parsed_path : $url;
+
+        return $this->matches_any_pattern($url, $patterns) || $this->matches_any_pattern($path, $patterns);
+    }
+
     private function is_cacheable_request() {
         if (!$this->setting_enabled('enable_page_cache')) {
+            return false;
+        }
+
+        if ($this->is_current_page_excluded()) {
             return false;
         }
 
@@ -384,6 +492,10 @@ class ReallySimpleCache {
      */
     private function can_optimize_output_request() {
         if (is_admin()) {
+            return false;
+        }
+
+        if ($this->is_current_page_excluded()) {
             return false;
         }
 
@@ -731,6 +843,10 @@ class ReallySimpleCache {
                     return $tag;
                 }
 
+                if ($this->is_asset_excluded($href, 'css')) {
+                    return $tag;
+                }
+
                 $host = wp_parse_url($this->build_absolute_url(home_url('/'), $href), PHP_URL_HOST);
                 if (!$host) {
                     return $tag;
@@ -903,6 +1019,10 @@ class ReallySimpleCache {
                     return $tag;
                 }
 
+                if ($this->is_asset_excluded($href, 'css')) {
+                    return $tag;
+                }
+
                 $path = $this->url_to_path($href);
                 if (!$path || !file_exists($path) || !is_readable($path)) {
                     return $tag;
@@ -952,6 +1072,10 @@ class ReallySimpleCache {
                 }
 
                 if (!$this->is_same_domain($href)) {
+                    return $tag;
+                }
+
+                if ($this->is_asset_excluded($href, 'css')) {
                     return $tag;
                 }
 
@@ -1052,6 +1176,10 @@ class ReallySimpleCache {
                     return $tag;
                 }
 
+                if ($this->is_asset_excluded($src, 'js')) {
+                    return $tag;
+                }
+
                 $path = $this->url_to_path($src);
                 if (!$path || !file_exists($path) || !is_readable($path)) {
                     return $tag;
@@ -1098,6 +1226,10 @@ class ReallySimpleCache {
                 $src = html_entity_decode($m[1]);
 
                 if (!$this->is_same_domain($src)) {
+                    return $tag;
+                }
+
+                if ($this->is_asset_excluded($src, 'js')) {
                     return $tag;
                 }
 
