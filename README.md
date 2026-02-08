@@ -8,6 +8,8 @@ A blazing-fast, lightweight, file-based cache plugin for WordPress designed to d
 
 No setup, no confusing options, no ads. Just enable and go.
 
+![Really Simple Cache](https://github.com/user-attachments/assets/5f52db53-c017-42d2-8570-55b850d12565)
+
 ## ✨ Features
 
 - ⚡ **Ultra-lightweight** — minimal code, no fluff  
