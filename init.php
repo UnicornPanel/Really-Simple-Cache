@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Really Simple Cache
  * Description: Super lightweight output cache with HTML/CSS/JS minification and auto-defer scripts.
- * Version: 2.2
+ * Version: 2.3
  * Author: UnicornPanel.net
  */
 
@@ -536,23 +536,60 @@ class ReallySimpleCache {
         return $this->cache_dir . 'pages/' . $key . '.html';
     }
 
+    private function get_cache_header_file() {
+        $uri = isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '/';
+        $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : wp_parse_url(home_url('/'), PHP_URL_HOST);
+        $scheme = is_ssl() ? 'https' : 'http';
+        $key = rsc_get_cache_key($uri, $host, $scheme);
+
+        return $this->cache_dir . 'pages/' . $key . '.headers.json';
+    }
+
+    private function get_cache_meta_file() {
+        $uri = isset($_SERVER['REQUEST_URI']) ? $_SERVER['REQUEST_URI'] : '/';
+        $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : wp_parse_url(home_url('/'), PHP_URL_HOST);
+        $scheme = is_ssl() ? 'https' : 'http';
+        $key = rsc_get_cache_key($uri, $host, $scheme);
+
+        return $this->cache_dir . 'pages/' . $key . '.meta.json';
+    }
+
     public function serve_cache() {
         if (!$this->is_cacheable_request()) {
             return;
         }
 
         $file = $this->get_cache_file();
+        $header_file = $this->get_cache_header_file();
 
         if (file_exists($file) && (time() - filemtime($file)) < $this->cache_ttl()) {
             $mtime = filemtime($file);
             $ttl = $this->cache_ttl();
 
+            $cached_header_names = [];
+            foreach ($this->read_cached_headers($header_file) as $header_line) {
+                $name = strtolower(trim(strtok($header_line, ':')));
+                if ($name !== '') {
+                    $cached_header_names[$name] = true;
+                }
+                $replace = ($name === 'content-type');
+                header($header_line, $replace);
+            }
+
             header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $mtime) . ' GMT');
-            header("Cache-Control: public, max-age={$ttl}");
-            header('Expires: ' . gmdate('D, d M Y H:i:s', time() + $ttl) . ' GMT');
+            if (empty($cached_header_names['cache-control'])) {
+                header("Cache-Control: public, max-age={$ttl}");
+            }
+            if (empty($cached_header_names['expires'])) {
+                header('Expires: ' . gmdate('D, d M Y H:i:s', time() + $ttl) . ' GMT');
+            }
             header('X-RSC-Cache: HIT');
-            header('Content-Type: text/html; charset=UTF-8');
-            header('Vary: Cookie');
+            if (empty($cached_header_names['content-type'])) {
+                header('Content-Type: text/html; charset=UTF-8');
+            }
+            if (empty($cached_header_names['vary'])) {
+                header('Vary: Cookie');
+            }
 
             $etag = '"' . md5_file($file) . '"';
             header("ETag: {$etag}");
@@ -1427,16 +1464,124 @@ class ReallySimpleCache {
             $html = $this->minify_html($html);
         }
 
-        if ($this->setting_enabled('debug_footer')) {
+        if ($this->setting_enabled('debug_footer') && $this->is_html_output($html)) {
             $html .= "\n<!-- Really Simple Cache | Cached on: " . date('Y-m-d H:i:s') . " -->";
         }
 
         if ($this->is_cacheable_request()) {
             $cache_file = $this->get_cache_file();
             $this->write_file_atomically($cache_file, $html);
+            $this->write_cache_headers($this->get_cache_header_file());
+            $this->write_cache_meta($this->get_cache_meta_file());
         }
 
         return $html;
+    }
+
+    private function is_html_output($html) {
+        if (function_exists('wp_is_json_request') && wp_is_json_request()) {
+            return false;
+        }
+
+        $content_type = $this->get_response_content_type();
+        if ($content_type !== null) {
+            return stripos($content_type, 'text/html') !== false;
+        }
+
+        return preg_match('/<!doctype\s+html|<html\b/i', $html) === 1;
+    }
+
+    private function get_response_content_type() {
+        if (!function_exists('headers_list')) {
+            return null;
+        }
+
+        foreach (headers_list() as $header) {
+            if (stripos($header, 'Content-Type:') === 0) {
+                return trim(substr($header, strlen('Content-Type:')));
+            }
+        }
+
+        return null;
+    }
+
+    private function write_cache_headers($header_file) {
+        $headers = $this->get_cacheable_headers();
+        if (empty($headers)) {
+            return;
+        }
+
+        $this->write_file_atomically($header_file, wp_json_encode(array_values($headers)));
+    }
+
+    private function read_cached_headers($header_file) {
+        if (!is_file($header_file) || !is_readable($header_file)) {
+            return [];
+        }
+
+        $raw = file_get_contents($header_file);
+        if ($raw === false) {
+            return [];
+        }
+
+        $decoded = json_decode($raw, true);
+        if (!is_array($decoded)) {
+            return [];
+        }
+
+        $headers = [];
+        foreach ($decoded as $header) {
+            if (is_string($header) && $header !== '') {
+                $headers[] = $header;
+            }
+        }
+
+        return $headers;
+    }
+
+    private function get_cacheable_headers() {
+        if (!function_exists('headers_list')) {
+            return [];
+        }
+
+        $disallowed = [
+            'connection',
+            'content-length',
+            'etag',
+            'keep-alive',
+            'last-modified',
+            'set-cookie',
+            'transfer-encoding',
+            'x-rsc-cache',
+        ];
+
+        $headers = [];
+        foreach (headers_list() as $header_line) {
+            $name = strtolower(trim(strtok($header_line, ':')));
+            if ($name === '' || in_array($name, $disallowed, true)) {
+                continue;
+            }
+            $headers[] = $header_line;
+        }
+
+        return $headers;
+    }
+
+    private function write_cache_meta($meta_file) {
+        $uri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '/';
+        $host = isset($_SERVER['HTTP_HOST']) ? (string) $_SERVER['HTTP_HOST'] : (string) wp_parse_url(home_url('/'), PHP_URL_HOST);
+        $scheme = is_ssl() ? 'https' : 'http';
+        $path = wp_parse_url($uri, PHP_URL_PATH);
+        $path = is_string($path) && $path !== '' ? $path : $uri;
+
+        $meta = [
+            'uri' => $uri,
+            'path' => $path,
+            'host' => strtolower($host),
+            'scheme' => strtolower($scheme),
+        ];
+
+        $this->write_file_atomically($meta_file, wp_json_encode($meta));
     }
 
     public function purge_all_cache(...$args) {
@@ -1623,21 +1768,56 @@ add_action('admin_post_rsc_clear_page', function() {
         wp_die('Invalid URL host.');
     }
 
-    $uri = isset($parts['path']) ? $parts['path'] : '/';
+    $path = isset($parts['path']) ? $parts['path'] : '/';
+    $uri = $path;
     if (!empty($parts['query'])) {
         $uri .= '?' . $parts['query'];
     }
 
     $upload    = wp_upload_dir();
     $cache_dir = trailingslashit($upload['basedir']) . 'really-simple-cache/pages/';
-    $file      = $cache_dir . rsc_get_cache_key(
+    $cache_key = rsc_get_cache_key(
         $uri,
         $parts['host'],
         isset($parts['scheme']) ? $parts['scheme'] : null
-    ) . '.html';
+    );
 
-    if (file_exists($file)) {
-        unlink($file);
+    foreach (['.html', '.headers.json', '.meta.json'] as $suffix) {
+        $file = $cache_dir . $cache_key . $suffix;
+        if (file_exists($file)) {
+            unlink($file);
+        }
+    }
+
+    $scheme = isset($parts['scheme']) ? strtolower((string) $parts['scheme']) : (is_ssl() ? 'https' : 'http');
+    $host = strtolower((string) $parts['host']);
+    $meta_files = glob($cache_dir . '*.meta.json') ?: [];
+    foreach ($meta_files as $meta_file) {
+        $raw = file_get_contents($meta_file);
+        if ($raw === false) {
+            continue;
+        }
+        $meta = json_decode($raw, true);
+        if (!is_array($meta)) {
+            continue;
+        }
+        if (strtolower((string) ($meta['host'] ?? '')) !== $host) {
+            continue;
+        }
+        if (strtolower((string) ($meta['scheme'] ?? '')) !== $scheme) {
+            continue;
+        }
+        if ((string) ($meta['path'] ?? '') !== $path) {
+            continue;
+        }
+
+        $base = substr($meta_file, 0, -strlen('.meta.json'));
+        foreach (['.html', '.headers.json', '.meta.json'] as $suffix) {
+            $file = $base . $suffix;
+            if (file_exists($file)) {
+                unlink($file);
+            }
+        }
     }
 
     $redirect_to = add_query_arg('cache_cleared', '1', $url);
