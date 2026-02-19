@@ -2,11 +2,12 @@
 /**
  * Plugin Name: Really Simple Cache
  * Description: Super lightweight output cache with HTML/CSS/JS minification and auto-defer scripts.
- * Version: 2.3
+ * Version: 2.4
  * Author: UnicornPanel.net
  */
 
 if (!defined('ABSPATH')) exit;
+require_once __DIR__ . '/includes/class-rsc-remove-unused-css.php';
 
 if (!function_exists('rsc_get_cache_key')) {
     /**
@@ -29,6 +30,7 @@ class ReallySimpleCache {
     private $cache_dir;
     private $cache_url;
     private $settings;
+    private $rucss;
 
     public function __construct() {
         $upload = wp_upload_dir();
@@ -76,10 +78,14 @@ class ReallySimpleCache {
             'combine_js' => 0,
             'local_avatars' => 0,
             'local_fonts' => 0,
+            'remove_unused_css' => 0,
             'asset_ttl' => 604800,
+            'rucss_max_css_kb' => 512,
             'excluded_pages' => '',
             'excluded_css' => '',
             'excluded_js' => '',
+            'rucss_excluded_pages' => '',
+            'rucss_keep_selectors' => '',
         ];
     }
 
@@ -133,11 +139,15 @@ class ReallySimpleCache {
             'combine_js' => empty($input['combine_js']) ? 0 : 1,
             'local_avatars' => empty($input['local_avatars']) ? 0 : 1,
             'local_fonts' => empty($input['local_fonts']) ? 0 : 1,
+            'remove_unused_css' => empty($input['remove_unused_css']) ? 0 : 1,
             'cache_ttl' => isset($input['cache_ttl']) ? max(60, (int) $input['cache_ttl']) : $defaults['cache_ttl'],
             'asset_ttl' => isset($input['asset_ttl']) ? max(3600, (int) $input['asset_ttl']) : $defaults['asset_ttl'],
+            'rucss_max_css_kb' => isset($input['rucss_max_css_kb']) ? max(32, (int) $input['rucss_max_css_kb']) : $defaults['rucss_max_css_kb'],
             'excluded_pages' => isset($input['excluded_pages']) ? sanitize_textarea_field($input['excluded_pages']) : '',
             'excluded_css' => isset($input['excluded_css']) ? sanitize_textarea_field($input['excluded_css']) : '',
             'excluded_js' => isset($input['excluded_js']) ? sanitize_textarea_field($input['excluded_js']) : '',
+            'rucss_excluded_pages' => isset($input['rucss_excluded_pages']) ? sanitize_textarea_field($input['rucss_excluded_pages']) : '',
+            'rucss_keep_selectors' => isset($input['rucss_keep_selectors']) ? sanitize_textarea_field($input['rucss_keep_selectors']) : '',
         ];
 
         $this->settings = wp_parse_args($settings, $defaults);
@@ -186,6 +196,7 @@ class ReallySimpleCache {
                         <?php $this->render_toggle('combine_js', 'Combine JS Files', 'Bundles same-domain head scripts into a combined file.'); ?>
                         <?php $this->render_toggle('local_avatars', 'Store Gravatar Avatars Locally', 'Caches Gravatar image responses in local uploads.'); ?>
                         <?php $this->render_toggle('local_fonts', 'Store Bunny and Google Fonts Locally', 'Downloads and rewrites Google/Bunny font stylesheets and font files.'); ?>
+                        <?php $this->render_toggle('remove_unused_css', 'Remove Unused CSS', 'Static pruning for same-domain external CSS. Off by default.'); ?>
 
                         <label class="rsc-field">
                             <span>Remote Asset TTL (seconds)</span>
@@ -210,6 +221,26 @@ class ReallySimpleCache {
                         <label class="rsc-field">
                             <span>Excluded JavaScript (allow wildcards)</span>
                             <textarea name="rsc_settings[excluded_js]" rows="4" placeholder="*gtag/js*&#10;*recaptcha*"><?php echo esc_textarea((string) $s['excluded_js']); ?></textarea>
+                        </label>
+                    </div>
+
+                    <div class="rsc-card rsc-card--full">
+                        <h2>Remove Unused CSS</h2>
+                        <p class="rsc-help">This feature is conservative, but JavaScript-driven UIs may still need safelisted selectors to avoid style regressions.</p>
+
+                        <label class="rsc-field">
+                            <span>RU-CSS Excluded Pages (allow wildcards)</span>
+                            <textarea name="rsc_settings[rucss_excluded_pages]" rows="4" placeholder="/checkout*&#10;/my-account*"><?php echo esc_textarea((string) $s['rucss_excluded_pages']); ?></textarea>
+                        </label>
+
+                        <label class="rsc-field">
+                            <span>RU-CSS Keep Selectors (Safelist, one pattern per line)</span>
+                            <textarea name="rsc_settings[rucss_keep_selectors]" rows="4" placeholder=".is-active&#10;#mobile-menu-open&#10;*[data-state=*]"><?php echo esc_textarea((string) $s['rucss_keep_selectors']); ?></textarea>
+                        </label>
+
+                        <label class="rsc-field">
+                            <span>Max CSS Size Per File (KB)</span>
+                            <input type="number" min="32" step="32" name="rsc_settings[rucss_max_css_kb]" value="<?php echo esc_attr((int) $s['rucss_max_css_kb']); ?>" />
                         </label>
                     </div>
                 </div>
@@ -335,6 +366,7 @@ class ReallySimpleCache {
             $this->cache_dir . 'pages/',
             $this->cache_dir . 'css/',
             $this->cache_dir . 'js/',
+            $this->cache_dir . 'rucss/',
             $this->cache_dir . 'avatars/',
             $this->cache_dir . 'fonts/',
             $this->cache_dir . 'fonts/css/',
@@ -633,6 +665,14 @@ class ReallySimpleCache {
         $css = preg_replace('/\s+/', ' ', $css);
         $css = preg_replace('/\s*([{};:,])\s*/', '$1', $css);
         return trim($css);
+    }
+
+    private function get_rucss_module() {
+        if (!($this->rucss instanceof RSC_Remove_Unused_CSS)) {
+            $this->rucss = new RSC_Remove_Unused_CSS($this->cache_dir, $this->cache_url);
+        }
+
+        return $this->rucss;
     }
 
     private function minify_js($js) {
@@ -1444,6 +1484,38 @@ class ReallySimpleCache {
             $html = $this->localize_font_stylesheets($html);
         }
 
+        if ($this->setting_enabled('remove_unused_css') && $this->is_html_output($html)) {
+            $uri = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '/';
+            $host = isset($_SERVER['HTTP_HOST']) ? (string) $_SERVER['HTTP_HOST'] : (string) wp_parse_url(home_url('/'), PHP_URL_HOST);
+            $scheme = is_ssl() ? 'https' : 'http';
+
+            $rucss_context = [
+                'request_uri' => $uri,
+                'page_key' => rsc_get_cache_key($uri, $host, $scheme),
+                'excluded_page_patterns' => $this->get_exclusion_patterns('rucss_excluded_pages'),
+                'keep_selector_patterns' => $this->get_exclusion_patterns('rucss_keep_selectors'),
+                'max_css_bytes' => max(32768, $this->setting_int('rucss_max_css_kb', 512) * 1024),
+                'get_stylesheet_href' => function ($tag) {
+                    $href = $this->get_stylesheet_href_from_tag($tag);
+                    return is_string($href) ? $href : '';
+                },
+                'is_same_domain' => function ($href) {
+                    return $this->is_same_domain($href);
+                },
+                'url_to_path' => function ($url) {
+                    return $this->url_to_path($url);
+                },
+                'is_asset_excluded' => function ($url, $type) {
+                    return $this->is_asset_excluded($url, $type);
+                },
+                'write_file_atomically' => function ($file, $contents) {
+                    return $this->write_file_atomically($file, $contents);
+                },
+            ];
+
+            $html = $this->get_rucss_module()->prune_html_stylesheets($html, $rucss_context);
+        }
+
         if ($this->setting_enabled('combine_css')) {
             $html = $this->combine_external_css_files($html);
         } else {
@@ -1593,6 +1665,7 @@ class ReallySimpleCache {
             $this->cache_dir . 'pages/',
             $this->cache_dir . 'css/',
             $this->cache_dir . 'js/',
+            $this->cache_dir . 'rucss/',
             $this->cache_dir . 'avatars/',
             $this->cache_dir . 'fonts/css/',
             $this->cache_dir . 'fonts/files/',
@@ -1725,6 +1798,7 @@ add_action('admin_post_rsc_clear_all', function() {
         $base . 'pages/',
         $base . 'css/',
         $base . 'js/',
+        $base . 'rucss/',
         $base . 'avatars/',
         $base . 'fonts/css/',
         $base . 'fonts/files/',
