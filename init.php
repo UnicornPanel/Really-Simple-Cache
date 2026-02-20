@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Really Simple Cache
  * Description: Super lightweight output cache with HTML/CSS/JS minification and auto-defer scripts.
- * Version: 2.4
+ * Version: 2.5
  * Author: UnicornPanel.net
  */
 
@@ -22,6 +22,78 @@ if (!function_exists('rsc_get_cache_key')) {
         $scheme = strtolower(trim((string) $scheme));
 
         return md5($scheme . '://' . $host . $uri);
+    }
+}
+
+if (!function_exists('rsc_get_debug_log_file')) {
+    function rsc_get_debug_log_file() {
+        $upload = wp_upload_dir();
+        return trailingslashit($upload['basedir']) . 'really-simple-cache/debug.log';
+    }
+}
+
+if (!function_exists('rsc_write_debug_log')) {
+    function rsc_write_debug_log($event, $context = [], $level = 'INFO') {
+        $event = trim((string) $event);
+        if ($event === '') {
+            return;
+        }
+
+        $log_file = rsc_get_debug_log_file();
+        $dir = dirname($log_file);
+        if (!is_dir($dir) && !wp_mkdir_p($dir)) {
+            return;
+        }
+
+        if (!is_array($context)) {
+            $context = ['value' => $context];
+        }
+
+        $normalized = [];
+        foreach ($context as $key => $value) {
+            if (is_scalar($value) || $value === null) {
+                $normalized[$key] = $value;
+                continue;
+            }
+
+            if (is_array($value) || is_object($value)) {
+                $normalized[$key] = wp_json_encode($value);
+                continue;
+            }
+
+            $normalized[$key] = gettype($value);
+        }
+
+        $timestamp = gmdate('Y-m-d H:i:s');
+        $level = strtoupper(preg_replace('/[^A-Z]/i', '', (string) $level));
+        if ($level === '') {
+            $level = 'INFO';
+        }
+
+        $line = sprintf(
+            "[%s UTC] [%s] %s | %s\n",
+            $timestamp,
+            $level,
+            $event,
+            wp_json_encode($normalized)
+        );
+
+        if (@file_put_contents($log_file, $line, FILE_APPEND | LOCK_EX) === false) {
+            return;
+        }
+
+        $raw = @file_get_contents($log_file);
+        if (!is_string($raw) || $raw === '') {
+            return;
+        }
+
+        $lines = preg_split('/\r\n|\r|\n/', trim($raw));
+        if (!is_array($lines) || count($lines) <= 1000) {
+            return;
+        }
+
+        $lines = array_slice($lines, -1000);
+        @file_put_contents($log_file, implode("\n", $lines) . "\n", LOCK_EX);
     }
 }
 
@@ -62,7 +134,13 @@ class ReallySimpleCache {
         if (is_admin()) {
             add_action('admin_menu', [$this, 'register_settings_page']);
             add_action('admin_init', [$this, 'register_settings']);
+            add_action('admin_post_rsc_clear_debug_log', [$this, 'handle_clear_debug_log']);
+            add_action('wp_ajax_rsc_refresh_debug_log', [$this, 'ajax_refresh_debug_log']);
         }
+
+        //$this->log('Plugin initialized', [
+        //    'cache_dir' => $this->cache_dir,
+        //]);
     }
 
     private function defaults() {
@@ -110,6 +188,38 @@ class ReallySimpleCache {
         return (int) $this->settings[$key];
     }
 
+    private function log($event, $context = [], $level = 'INFO') {
+        if (!is_array($context)) {
+            $context = ['value' => $context];
+        }
+
+        if (!isset($context['request_uri'])) {
+            $context['request_uri'] = isset($_SERVER['REQUEST_URI']) ? (string) $_SERVER['REQUEST_URI'] : '';
+        }
+
+        rsc_write_debug_log($event, $context, $level);
+    }
+
+    private function get_debug_log_contents($max_lines = 300) {
+        $file = rsc_get_debug_log_file();
+        if (!is_file($file) || !is_readable($file)) {
+            return '';
+        }
+
+        $raw = @file_get_contents($file);
+        if (!is_string($raw) || $raw === '') {
+            return '';
+        }
+
+        $lines = preg_split('/\r\n|\r|\n/', trim($raw));
+        if (!is_array($lines) || empty($lines)) {
+            return '';
+        }
+
+        $slice = array_slice($lines, -max(1, (int) $max_lines));
+        return implode("\n", $slice);
+    }
+
     public function register_settings_page() {
         add_options_page(
             'RS Cache',
@@ -122,6 +232,38 @@ class ReallySimpleCache {
 
     public function register_settings() {
         register_setting('rsc_settings_group', 'rsc_settings', [$this, 'sanitize_settings']);
+    }
+
+    public function handle_clear_debug_log() {
+        if (!current_user_can('manage_options')) {
+            wp_die('No permission.');
+        }
+
+        check_admin_referer('rsc_clear_debug_log');
+
+        $file = rsc_get_debug_log_file();
+        if (is_file($file)) {
+            @file_put_contents($file, '');
+        }
+
+        $this->log('Debug log cleared by admin user', [
+            'user_id' => get_current_user_id(),
+        ]);
+
+        wp_safe_redirect(admin_url('options-general.php?page=rsc-settings&debug_log_cleared=1'));
+        exit;
+    }
+
+    public function ajax_refresh_debug_log() {
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error(['message' => 'No permission.'], 403);
+        }
+
+        check_ajax_referer('rsc_refresh_debug_log');
+
+        wp_send_json_success([
+            'log' => $this->get_debug_log_contents(300),
+        ]);
     }
 
     public function sanitize_settings($input) {
@@ -152,6 +294,19 @@ class ReallySimpleCache {
 
         $this->settings = wp_parse_args($settings, $defaults);
         $this->purge_all_cache();
+        $this->log('Settings saved and cache purged', [
+            'user_id' => get_current_user_id(),
+            'enable_page_cache' => (int) $this->settings['enable_page_cache'],
+            'minify_html' => (int) $this->settings['minify_html'],
+            'minify_css' => (int) $this->settings['minify_css'],
+            'minify_js' => (int) $this->settings['minify_js'],
+            'defer_scripts' => (int) $this->settings['defer_scripts'],
+            'combine_css' => (int) $this->settings['combine_css'],
+            'combine_js' => (int) $this->settings['combine_js'],
+            'local_avatars' => (int) $this->settings['local_avatars'],
+            'local_fonts' => (int) $this->settings['local_fonts'],
+            'remove_unused_css' => (int) $this->settings['remove_unused_css'],
+        ]);
 
         return $this->settings;
     }
@@ -162,6 +317,8 @@ class ReallySimpleCache {
         }
 
         $s = $this->settings;
+        $debug_log = $this->get_debug_log_contents(300);
+        $refresh_nonce = wp_create_nonce('rsc_refresh_debug_log');
         ?>
         <div class="wrap rsc-settings-wrap">
             <h1>RS Cache</h1>
@@ -243,9 +400,29 @@ class ReallySimpleCache {
                             <input type="number" min="32" step="32" name="rsc_settings[rucss_max_css_kb]" value="<?php echo esc_attr((int) $s['rucss_max_css_kb']); ?>" />
                         </label>
                     </div>
+
+                    <div class="rsc-card rsc-card--full">
+                        <h2>Debug Log</h2>
+                        <p class="rsc-help">Latest log lines (file capped at 1000 lines): <code><?php echo esc_html(rsc_get_debug_log_file()); ?></code></p>
+                        <textarea class="rsc-debug-log" readonly><?php echo esc_textarea($debug_log); ?></textarea>
+                        <p>
+                            <button
+                                type="button"
+                                class="button rsc-refresh-log"
+                                data-ajax-url="<?php echo esc_url(admin_url('admin-ajax.php')); ?>"
+                                data-nonce="<?php echo esc_attr($refresh_nonce); ?>"
+                            >Refresh Log</button>
+                        </p>
+                    </div>
                 </div>
 
                 <?php submit_button('Save RS Cache Settings'); ?>
+            </form>
+
+            <form method="post" action="<?php echo esc_url(admin_url('admin-post.php')); ?>">
+                <?php wp_nonce_field('rsc_clear_debug_log'); ?>
+                <input type="hidden" name="action" value="rsc_clear_debug_log" />
+                <?php submit_button('Clear Debug Log', 'delete', 'submit', false); ?>
             </form>
         </div>
 
@@ -340,7 +517,65 @@ class ReallySimpleCache {
                 margin: 0 0 14px;
                 color: #516170;
             }
+            .rsc-debug-log {
+                width: 100%;
+                min-height: 320px;
+                font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+                white-space: pre;
+            }
         </style>
+        <script>
+            (function () {
+                var logBox = document.querySelector('.rsc-debug-log');
+                var refreshButton = document.querySelector('.rsc-refresh-log');
+
+                function scrollLogToBottom() {
+                    if (!logBox) return;
+                    logBox.scrollTop = logBox.scrollHeight;
+                }
+
+                scrollLogToBottom();
+
+                if (!refreshButton || !logBox) {
+                    return;
+                }
+
+                refreshButton.addEventListener('click', function () {
+                    var ajaxUrl = refreshButton.getAttribute('data-ajax-url');
+                    var nonce = refreshButton.getAttribute('data-nonce');
+                    if (!ajaxUrl || !nonce) {
+                        return;
+                    }
+
+                    var originalLabel = refreshButton.textContent;
+                    refreshButton.disabled = true;
+                    refreshButton.textContent = 'Refreshing...';
+
+                    var body = new URLSearchParams();
+                    body.set('action', 'rsc_refresh_debug_log');
+                    body.set('_ajax_nonce', nonce);
+
+                    fetch(ajaxUrl, {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
+                        },
+                        body: body.toString()
+                    }).then(function (response) {
+                        return response.json();
+                    }).then(function (data) {
+                        if (data && data.success && data.data && typeof data.data.log === 'string') {
+                            logBox.value = data.data.log;
+                            scrollLogToBottom();
+                        }
+                    }).finally(function () {
+                        refreshButton.disabled = false;
+                        refreshButton.textContent = originalLabel;
+                    });
+                });
+            })();
+        </script>
         <?php
     }
 
@@ -373,10 +608,17 @@ class ReallySimpleCache {
             $this->cache_dir . 'fonts/files/',
         ];
 
+        $created = 0;
         foreach ($paths as $path) {
             if (!file_exists($path)) {
-                wp_mkdir_p($path);
+                if (wp_mkdir_p($path)) {
+                    $created++;
+                }
             }
+        }
+
+        if ($created > 0) {
+            $this->log('Created cache directories', ['count' => $created]);
         }
     }
 
@@ -454,40 +696,49 @@ class ReallySimpleCache {
         return $this->matches_any_pattern($url, $patterns) || $this->matches_any_pattern($path, $patterns);
     }
 
-    private function is_cacheable_request() {
+    private function is_cacheable_request(&$reason = null) {
         if (!$this->setting_enabled('enable_page_cache')) {
+            $reason = 'page-cache-disabled';
             return false;
         }
 
         if ($this->is_current_page_excluded()) {
+            $reason = 'page-excluded';
             return false;
         }
 
         if (is_user_logged_in()) {
+            $reason = 'logged-in-user';
             return false;
         }
 
         if (is_preview() || is_customize_preview()) {
+            $reason = 'preview-request';
             return false;
         }
 
         if (php_sapi_name() === 'cli') {
+            $reason = 'cli-context';
             return false;
         }
 
         if (!isset($_SERVER['REQUEST_METHOD']) || $_SERVER['REQUEST_METHOD'] !== 'GET') {
+            $reason = 'non-get-request';
             return false;
         }
 
         if (defined('DOING_AJAX') && DOING_AJAX) {
+            $reason = 'ajax-request';
             return false;
         }
 
         if (defined('REST_REQUEST') && REST_REQUEST) {
+            $reason = 'rest-request';
             return false;
         }
 
         if (isset($_GET['preview']) || isset($_GET['customize_changeset_uuid'])) {
+            $reason = 'preview-query-flag';
             return false;
         }
 
@@ -506,6 +757,7 @@ class ReallySimpleCache {
             foreach (array_keys($_COOKIE) as $cookie_name) {
                 foreach ($bypass_cookies as $prefix) {
                     if ($prefix !== '' && strpos($cookie_name, $prefix) === 0) {
+                        $reason = 'bypass-cookie:' . $prefix;
                         return false;
                     }
                 }
@@ -513,49 +765,60 @@ class ReallySimpleCache {
         }
 
         if (is_feed() || is_trackback() || is_robots() || is_search()) {
+            $reason = 'non-html-endpoint';
             return false;
         }
 
+        $reason = 'ok';
         return true;
     }
 
     /**
      * Requests eligible for output optimization, even when page caching is bypassed.
      */
-    private function can_optimize_output_request() {
+    private function can_optimize_output_request(&$reason = null) {
         if (is_admin()) {
+            $reason = 'admin-request';
             return false;
         }
 
         if ($this->is_current_page_excluded()) {
+            $reason = 'page-excluded';
             return false;
         }
 
         // Disable all output optimizations for logged-in users.
         if (is_user_logged_in()) {
+            $reason = 'logged-in-user';
             return false;
         }
 
         if (php_sapi_name() === 'cli') {
+            $reason = 'cli-context';
             return false;
         }
 
         if (!isset($_SERVER['REQUEST_METHOD']) || $_SERVER['REQUEST_METHOD'] !== 'GET') {
+            $reason = 'non-get-request';
             return false;
         }
 
         if (defined('DOING_AJAX') && DOING_AJAX) {
+            $reason = 'ajax-request';
             return false;
         }
 
         if (defined('REST_REQUEST') && REST_REQUEST) {
+            $reason = 'rest-request';
             return false;
         }
 
         if (is_feed() || is_trackback() || is_robots()) {
+            $reason = 'non-html-endpoint';
             return false;
         }
 
+        $reason = 'ok';
         return true;
     }
 
@@ -587,7 +850,8 @@ class ReallySimpleCache {
     }
 
     public function serve_cache() {
-        if (!$this->is_cacheable_request()) {
+        $reason = '';
+        if (!$this->is_cacheable_request($reason)) {
             return;
         }
 
@@ -627,24 +891,45 @@ class ReallySimpleCache {
             header("ETag: {$etag}");
 
             if (isset($_SERVER['HTTP_IF_NONE_MATCH']) && trim($_SERVER['HTTP_IF_NONE_MATCH']) === $etag) {
+                $this->log('Cache 304 response', [
+                    'file' => basename($file),
+                    'reason' => $reason,
+                ]);
                 header('HTTP/1.1 304 Not Modified');
                 exit;
             }
 
+            $this->log('Cache HIT served', [
+                'file' => basename($file),
+                'ttl' => $ttl,
+            ]);
             readfile($file);
             exit;
         }
+
+        $this->log('Cache MISS from disk', [
+            'file' => basename($file),
+        ]);
     }
 
     public function start_buffer() {
-        if (!$this->can_optimize_output_request()) {
+        $optimize_reason = '';
+        if (!$this->can_optimize_output_request($optimize_reason)) {
             return;
         }
 
-        if ($this->is_cacheable_request()) {
+        $cache_reason = '';
+        if ($this->is_cacheable_request($cache_reason)) {
             header('X-RSC-Cache: MISS');
+            $this->log('Output buffering started', [
+                'cache' => 'MISS',
+            ]);
         } else {
             header('X-RSC-Cache: BYPASS');
+            $this->log('Output buffering started', [
+                'cache' => 'BYPASS',
+                'reason' => $cache_reason,
+            ]);
         }
         ob_start([$this, 'process_output']);
     }
@@ -737,6 +1022,7 @@ class ReallySimpleCache {
     private function write_file_atomically($file, $contents) {
         $dir = dirname($file);
         if (!is_dir($dir) && !wp_mkdir_p($dir)) {
+            $this->log('Failed to create directory for write', ['dir' => $dir], 'WARN');
             return false;
         }
 
@@ -745,11 +1031,13 @@ class ReallySimpleCache {
             if (file_exists($tmp)) {
                 unlink($tmp);
             }
+            $this->log('Failed writing temporary file', ['tmp_file' => $tmp], 'WARN');
             return false;
         }
 
         if (!rename($tmp, $file)) {
             unlink($tmp);
+            $this->log('Failed moving temporary file into place', ['file' => $file], 'WARN');
             return false;
         }
 
@@ -850,6 +1138,7 @@ class ReallySimpleCache {
     private function download_remote_asset($url, $target_dir, $prefix = 'asset', $timeout = 5) {
         $url = $this->build_absolute_url(home_url('/'), $url);
         if (!preg_match('#^https?://#i', $url)) {
+            $this->log('Skipped remote asset download (invalid URL)', ['url' => $url], 'WARN');
             return false;
         }
 
@@ -857,6 +1146,7 @@ class ReallySimpleCache {
         $dir = trailingslashit($this->cache_dir . trim($target_dir, '/'));
 
         if (!is_dir($dir) && !wp_mkdir_p($dir)) {
+            $this->log('Failed to create asset directory', ['dir' => $dir], 'WARN');
             return false;
         }
 
@@ -873,16 +1163,25 @@ class ReallySimpleCache {
         ]);
 
         if (is_wp_error($res)) {
+            $this->log('Remote asset download failed (WP_Error)', [
+                'url' => $url,
+                'error' => $res->get_error_message(),
+            ], 'WARN');
             return false;
         }
 
         $code = wp_remote_retrieve_response_code($res);
         if ($code < 200 || $code >= 300) {
+            $this->log('Remote asset download failed (HTTP status)', [
+                'url' => $url,
+                'status' => $code,
+            ], 'WARN');
             return false;
         }
 
         $body = wp_remote_retrieve_body($res);
         if ($body === '') {
+            $this->log('Remote asset download returned empty body', ['url' => $url], 'WARN');
             return false;
         }
 
@@ -904,8 +1203,14 @@ class ReallySimpleCache {
 
         $file = $dir . $prefix . '-' . $hash . '.' . preg_replace('/[^a-z0-9]/i', '', $ext);
         if (!$this->write_file_atomically($file, $body)) {
+            $this->log('Failed to store downloaded remote asset', ['file' => $file], 'WARN');
             return false;
         }
+
+        $this->log('Remote asset downloaded', [
+            'url' => $url,
+            'target' => basename($file),
+        ]);
 
         return trailingslashit($this->cache_url . trim($target_dir, '/')) . basename($file);
     }
@@ -1013,6 +1318,13 @@ class ReallySimpleCache {
         if ($local_css) {
             // Cached pages may still point to remote font URLs.
             $this->purge_page_cache_files();
+            $this->log('Font stylesheet cached and page cache purged', [
+                'url' => $url,
+            ]);
+        } else {
+            $this->log('Font stylesheet caching skipped/failed', [
+                'url' => $url,
+            ], 'WARN');
         }
         delete_transient('rsc_font_queue_' . md5($url));
     }
@@ -1039,16 +1351,25 @@ class ReallySimpleCache {
         ]);
 
         if (is_wp_error($res)) {
+            $this->log('Font stylesheet request failed', [
+                'url' => $url,
+                'error' => $res->get_error_message(),
+            ], 'WARN');
             return false;
         }
 
         $code = wp_remote_retrieve_response_code($res);
         if ($code < 200 || $code >= 300) {
+            $this->log('Font stylesheet request returned non-2xx', [
+                'url' => $url,
+                'status' => $code,
+            ], 'WARN');
             return false;
         }
 
         $css = wp_remote_retrieve_body($res);
         if (!is_string($css) || $css === '') {
+            $this->log('Font stylesheet body was empty', ['url' => $url], 'WARN');
             return false;
         }
 
@@ -1076,8 +1397,14 @@ class ReallySimpleCache {
         }
 
         if (!$this->write_file_atomically($file, $css)) {
+            $this->log('Failed to write cached font stylesheet', ['file' => $file], 'WARN');
             return false;
         }
+
+        $this->log('Cached font stylesheet', [
+            'url' => $url,
+            'target' => basename($file),
+        ]);
 
         return $local_url;
     }
@@ -1545,6 +1872,12 @@ class ReallySimpleCache {
             $this->write_file_atomically($cache_file, $html);
             $this->write_cache_headers($this->get_cache_header_file());
             $this->write_cache_meta($this->get_cache_meta_file());
+            $this->log('Cached optimized page output', [
+                'file' => basename($cache_file),
+                'bytes' => strlen($html),
+            ]);
+        } else {
+            $this->log('Processed output without page cache write');
         }
 
         return $html;
@@ -1584,6 +1917,10 @@ class ReallySimpleCache {
         }
 
         $this->write_file_atomically($header_file, wp_json_encode(array_values($headers)));
+        $this->log('Stored cache response headers', [
+            'file' => basename($header_file),
+            'count' => count($headers),
+        ]);
     }
 
     private function read_cached_headers($header_file) {
@@ -1654,6 +1991,10 @@ class ReallySimpleCache {
         ];
 
         $this->write_file_atomically($meta_file, wp_json_encode($meta));
+        $this->log('Stored cache metadata', [
+            'file' => basename($meta_file),
+            'path' => $path,
+        ]);
     }
 
     public function purge_all_cache(...$args) {
@@ -1671,6 +2012,7 @@ class ReallySimpleCache {
             $this->cache_dir . 'fonts/files/',
         ];
 
+        $deleted = 0;
         foreach ($dirs as $dir) {
             if (!is_dir($dir)) {
                 continue;
@@ -1683,10 +2025,17 @@ class ReallySimpleCache {
 
             foreach ($files as $file) {
                 if (is_file($file) && is_writable($file)) {
-                    unlink($file);
+                    if (unlink($file)) {
+                        $deleted++;
+                    }
                 }
             }
         }
+
+        $this->log('Purged all cache artifacts', [
+            'deleted_files' => $deleted,
+            'args_count' => count($args),
+        ]);
     }
 
     /**
@@ -1703,10 +2052,19 @@ class ReallySimpleCache {
             return;
         }
 
+        $deleted = 0;
         foreach ($files as $file) {
             if (is_file($file) && is_writable($file)) {
-                unlink($file);
+                if (unlink($file)) {
+                    $deleted++;
+                }
             }
+        }
+
+        if ($deleted > 0) {
+            $this->log('Purged page cache files', [
+                'deleted_files' => $deleted,
+            ]);
         }
     }
 
@@ -1732,11 +2090,23 @@ class ReallySimpleCache {
 
         foreach (glob($this->cache_dir . 'avatars/avatar-' . $hash . '.*') ?: [] as $existing) {
             if (is_file($existing) && (time() - filemtime($existing)) < $this->asset_ttl()) {
+                //$this->log('Served local avatar cache HIT', [
+                //    'avatar' => basename($existing),
+                //]);
                 return $this->cache_url . 'avatars/' . basename($existing);
             }
         }
 
         $local = $this->download_remote_asset($normalized, 'avatars', 'avatar');
+        if ($local) {
+            $this->log('Cached remote avatar locally', [
+                'source' => $normalized,
+            ]);
+        } else {
+            $this->log('Avatar localization failed, using remote URL', [
+                'source' => $normalized,
+            ], 'WARN');
+        }
         return $local ? $local : $url;
     }
 }
@@ -1819,6 +2189,11 @@ add_action('admin_post_rsc_clear_all', function() {
         }
     }
 
+    rsc_write_debug_log('Admin cleared all cache artifacts', [
+        'user_id' => get_current_user_id(),
+        'deleted_files' => $deleted,
+    ]);
+
     wp_safe_redirect(admin_url('index.php?cache_all_cleared=' . $deleted));
     exit;
 });
@@ -1856,10 +2231,13 @@ add_action('admin_post_rsc_clear_page', function() {
         isset($parts['scheme']) ? $parts['scheme'] : null
     );
 
+    $deleted = 0;
     foreach (['.html', '.headers.json', '.meta.json'] as $suffix) {
         $file = $cache_dir . $cache_key . $suffix;
         if (file_exists($file)) {
-            unlink($file);
+            if (unlink($file)) {
+                $deleted++;
+            }
         }
     }
 
@@ -1889,10 +2267,18 @@ add_action('admin_post_rsc_clear_page', function() {
         foreach (['.html', '.headers.json', '.meta.json'] as $suffix) {
             $file = $base . $suffix;
             if (file_exists($file)) {
-                unlink($file);
+                if (unlink($file)) {
+                    $deleted++;
+                }
             }
         }
     }
+
+    rsc_write_debug_log('Admin cleared page cache', [
+        'user_id' => get_current_user_id(),
+        'url' => $url,
+        'deleted_files' => $deleted,
+    ]);
 
     $redirect_to = add_query_arg('cache_cleared', '1', $url);
     wp_safe_redirect($redirect_to);
@@ -1907,5 +2293,9 @@ add_action('admin_notices', function() {
 
     if (isset($_GET['cache_cleared'])) {
         echo '<div class="notice notice-success"><p><strong>Really Simple Cache:</strong> Page cache cleared.</p></div>';
+    }
+
+    if (isset($_GET['debug_log_cleared'])) {
+        echo '<div class="notice notice-success"><p><strong>Really Simple Cache:</strong> Debug log cleared.</p></div>';
     }
 });
