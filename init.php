@@ -2,12 +2,16 @@
 /**
  * Plugin Name: Really Simple Cache
  * Description: Super lightweight output cache with HTML/CSS/JS minification and auto-defer scripts.
- * Version: 2.5
+ * Version: 2.6
  * Author: UnicornPanel.net
  */
 
 if (!defined('ABSPATH')) exit;
 require_once __DIR__ . '/includes/class-rsc-remove-unused-css.php';
+require_once __DIR__ . '/includes/class-rsc-script-deferrer.php';
+require_once __DIR__ . '/includes/class-rsc-script-delayer.php';
+require_once __DIR__ . '/includes/class-rsc-minifier.php';
+require_once __DIR__ . '/includes/class-rsc-asset-combiner.php';
 
 if (!function_exists('rsc_get_cache_key')) {
     /**
@@ -103,6 +107,10 @@ class ReallySimpleCache {
     private $cache_url;
     private $settings;
     private $rucss;
+    private $script_deferrer;
+    private $script_delayer;
+    private $minifier;
+    private $asset_combiner;
 
     public function __construct() {
         $upload = wp_upload_dir();
@@ -151,6 +159,7 @@ class ReallySimpleCache {
             'minify_css' => 1,
             'minify_js' => 1,
             'defer_scripts' => 1,
+            'delay_scripts' => 0,
             'debug_footer' => 1,
             'combine_css' => 0,
             'combine_js' => 0,
@@ -162,6 +171,7 @@ class ReallySimpleCache {
             'excluded_pages' => '',
             'excluded_css' => '',
             'excluded_js' => '',
+            'excluded_delay_js' => '',
             'rucss_excluded_pages' => '',
             'rucss_keep_selectors' => '',
         ];
@@ -276,6 +286,7 @@ class ReallySimpleCache {
             'minify_css' => empty($input['minify_css']) ? 0 : 1,
             'minify_js' => empty($input['minify_js']) ? 0 : 1,
             'defer_scripts' => empty($input['defer_scripts']) ? 0 : 1,
+            'delay_scripts' => empty($input['delay_scripts']) ? 0 : 1,
             'debug_footer' => empty($input['debug_footer']) ? 0 : 1,
             'combine_css' => empty($input['combine_css']) ? 0 : 1,
             'combine_js' => empty($input['combine_js']) ? 0 : 1,
@@ -288,6 +299,7 @@ class ReallySimpleCache {
             'excluded_pages' => isset($input['excluded_pages']) ? sanitize_textarea_field($input['excluded_pages']) : '',
             'excluded_css' => isset($input['excluded_css']) ? sanitize_textarea_field($input['excluded_css']) : '',
             'excluded_js' => isset($input['excluded_js']) ? sanitize_textarea_field($input['excluded_js']) : '',
+            'excluded_delay_js' => isset($input['excluded_delay_js']) ? sanitize_textarea_field($input['excluded_delay_js']) : '',
             'rucss_excluded_pages' => isset($input['rucss_excluded_pages']) ? sanitize_textarea_field($input['rucss_excluded_pages']) : '',
             'rucss_keep_selectors' => isset($input['rucss_keep_selectors']) ? sanitize_textarea_field($input['rucss_keep_selectors']) : '',
         ];
@@ -301,6 +313,7 @@ class ReallySimpleCache {
             'minify_css' => (int) $this->settings['minify_css'],
             'minify_js' => (int) $this->settings['minify_js'],
             'defer_scripts' => (int) $this->settings['defer_scripts'],
+            'delay_scripts' => (int) $this->settings['delay_scripts'],
             'combine_css' => (int) $this->settings['combine_css'],
             'combine_js' => (int) $this->settings['combine_js'],
             'local_avatars' => (int) $this->settings['local_avatars'],
@@ -345,6 +358,7 @@ class ReallySimpleCache {
                         <?php $this->render_toggle('minify_css', 'Minify CSS', 'Minifies external and inline CSS.'); ?>
                         <?php $this->render_toggle('minify_js', 'Minify JS', 'Minifies external and inline JavaScript.'); ?>
                         <?php $this->render_toggle('defer_scripts', 'Defer Scripts', 'Adds defer to eligible scripts.'); ?>
+                        <?php $this->render_toggle('delay_scripts', 'Delay Scripts', 'Delays eligible external scripts until user interaction or timeout.'); ?>
                     </div>
 
                     <div class="rsc-card">
@@ -378,6 +392,11 @@ class ReallySimpleCache {
                         <label class="rsc-field">
                             <span>Excluded JavaScript (allow wildcards)</span>
                             <textarea name="rsc_settings[excluded_js]" rows="4" placeholder="*gtag/js*&#10;*recaptcha*"><?php echo esc_textarea((string) $s['excluded_js']); ?></textarea>
+                        </label>
+
+                        <label class="rsc-field">
+                            <span>Excluded Delayed JavaScript (allow wildcards)</span>
+                            <textarea name="rsc_settings[excluded_delay_js]" rows="4" placeholder="*jquery*&#10;*recaptcha*"><?php echo esc_textarea((string) $s['excluded_delay_js']); ?></textarea>
                         </label>
                     </div>
 
@@ -696,6 +715,23 @@ class ReallySimpleCache {
         return $this->matches_any_pattern($url, $patterns) || $this->matches_any_pattern($path, $patterns);
     }
 
+    private function is_delay_script_excluded($url) {
+        if ($this->is_asset_excluded($url, 'js')) {
+            return true;
+        }
+
+        $patterns = $this->get_exclusion_patterns('excluded_delay_js');
+        if (empty($patterns)) {
+            return false;
+        }
+
+        $url = (string) $url;
+        $parsed_path = wp_parse_url($url, PHP_URL_PATH);
+        $path = is_string($parsed_path) ? $parsed_path : $url;
+
+        return $this->matches_any_pattern($url, $patterns) || $this->matches_any_pattern($path, $patterns);
+    }
+
     private function is_cacheable_request(&$reason = null) {
         if (!$this->setting_enabled('enable_page_cache')) {
             $reason = 'page-cache-disabled';
@@ -941,15 +977,11 @@ class ReallySimpleCache {
     }
 
     private function minify_html($html) {
-        $html = preg_replace('/>\s+</', '><', $html);
-        return trim($html);
+        return $this->get_minifier()->minify_html((string) $html);
     }
 
     private function minify_css($css) {
-        $css = preg_replace('!/\*.*?\*/!s', '', $css);
-        $css = preg_replace('/\s+/', ' ', $css);
-        $css = preg_replace('/\s*([{};:,])\s*/', '$1', $css);
-        return trim($css);
+        return $this->get_minifier()->minify_css((string) $css);
     }
 
     private function get_rucss_module() {
@@ -960,13 +992,40 @@ class ReallySimpleCache {
         return $this->rucss;
     }
 
-    private function minify_js($js) {
-        require_once __DIR__ . '/JSMin.php';
-        try {
-            return \JSMin\JSMin::minify($js);
-        } catch (\Exception $e) {
-            return $js;
+    private function get_script_deferrer() {
+        if (!($this->script_deferrer instanceof RSC_Script_Deferrer)) {
+            $this->script_deferrer = new RSC_Script_Deferrer();
         }
+
+        return $this->script_deferrer;
+    }
+
+    private function get_script_delayer() {
+        if (!($this->script_delayer instanceof RSC_Script_Delayer)) {
+            $this->script_delayer = new RSC_Script_Delayer();
+        }
+
+        return $this->script_delayer;
+    }
+
+    private function get_minifier() {
+        if (!($this->minifier instanceof RSC_Minifier)) {
+            $this->minifier = new RSC_Minifier(__DIR__);
+        }
+
+        return $this->minifier;
+    }
+
+    private function get_asset_combiner() {
+        if (!($this->asset_combiner instanceof RSC_Asset_Combiner)) {
+            $this->asset_combiner = new RSC_Asset_Combiner();
+        }
+
+        return $this->asset_combiner;
+    }
+
+    private function minify_js($js) {
+        return $this->get_minifier()->minify_js((string) $js);
     }
 
     private function is_same_domain($url) {
@@ -1135,6 +1194,35 @@ class ReallySimpleCache {
         );
     }
 
+    private function get_remote_last_modified_age($url, $timeout = 5) {
+        $res = wp_remote_head($url, [
+            'timeout' => max(1, (int) $timeout),
+            'redirection' => 3,
+            'user-agent' => 'Really Simple Cache',
+        ]);
+
+        if (is_wp_error($res)) {
+            return null;
+        }
+
+        $code = wp_remote_retrieve_response_code($res);
+        if ($code < 200 || $code >= 300) {
+            return null;
+        }
+
+        $last_modified = (string) wp_remote_retrieve_header($res, 'last-modified');
+        if ($last_modified === '') {
+            return null;
+        }
+
+        $ts = strtotime($last_modified);
+        if ($ts === false || $ts <= 0) {
+            return null;
+        }
+
+        return max(0, time() - $ts);
+    }
+
     private function download_remote_asset($url, $target_dir, $prefix = 'asset', $timeout = 5) {
         $url = $this->build_absolute_url(home_url('/'), $url);
         if (!preg_match('#^https?://#i', $url)) {
@@ -1150,9 +1238,41 @@ class ReallySimpleCache {
             return false;
         }
 
-        foreach (glob($dir . $prefix . '-' . $hash . '.*') ?: [] as $existing) {
-            if (is_file($existing) && (time() - filemtime($existing)) < $this->asset_ttl()) {
+        $existing_files = glob($dir . $prefix . '-' . $hash . '.*') ?: [];
+        $stale_existing = null;
+        $stale_existing_mtime = 0;
+
+        foreach ($existing_files as $existing) {
+            if (!is_file($existing)) {
+                continue;
+            }
+
+            if ((time() - filemtime($existing)) < $this->asset_ttl()) {
                 return trailingslashit($this->cache_url . trim($target_dir, '/')) . basename($existing);
+            }
+
+            $mtime = (int) filemtime($existing);
+            if ($mtime > $stale_existing_mtime) {
+                $stale_existing = $existing;
+                $stale_existing_mtime = $mtime;
+            }
+        }
+
+        $is_font_file = trim($target_dir, '/') === 'fonts/files';
+        if ($is_font_file && $stale_existing) {
+            $remote_age = $this->get_remote_last_modified_age($url, $timeout);
+            if (is_int($remote_age) && $remote_age >= (7 * DAY_IN_SECONDS)) {
+                if (!touch($stale_existing)) {
+                    $this->log('Failed to refresh stale local font mtime', [
+                        'file' => $stale_existing,
+                    ], 'WARN');
+                }
+                $this->log('Reused stale local font file (remote is older than 7 days)', [
+                    'url' => $url,
+                    'target' => basename($stale_existing),
+                    'remote_age_seconds' => $remote_age,
+                ]);
+                return trailingslashit($this->cache_url . trim($target_dir, '/')) . basename($stale_existing);
             }
         }
 
@@ -1410,372 +1530,118 @@ class ReallySimpleCache {
     }
 
     private function minify_external_css_files($html) {
-        return preg_replace_callback(
-            '/<link\b[^>]*>/i',
-            function ($m) {
-                $tag = $m[0];
-                $href = $this->get_stylesheet_href_from_tag($tag);
-                if (!$href) {
-                    return $tag;
-                }
-
-                if (!$this->is_same_domain($href)) {
-                    return $tag;
-                }
-
-                if ($this->is_asset_excluded($href, 'css')) {
-                    return $tag;
-                }
-
-                $path = $this->url_to_path($href);
-                if (!$path || !file_exists($path) || !is_readable($path)) {
-                    return $tag;
-                }
-
-                $css = file_get_contents($path);
-                if ($css === false || $css === '') {
-                    return $tag;
-                }
-
-                $css = $this->rewrite_css_urls_for_file($css, $href);
-                $min = $this->setting_enabled('minify_css') ? $this->minify_css($css) : $css;
-                if ($min === '') {
-                    return $tag;
-                }
-
-                $hash = md5($href . '|' . $min);
-                $rel  = 'css/' . $hash . '.css';
-                $file = $this->cache_dir . $rel;
-                $url  = $this->cache_url . $rel;
-
-                if (!file_exists($file)) {
-                    $this->write_file_atomically($file, $min);
-                }
-
-                return preg_replace(
-                    '/href=["\'][^"\']+["\']/',
-                    'href="' . esc_url($url) . '"',
-                    $tag,
-                    1
-                );
+        return $this->get_minifier()->minify_external_css_files((string) $html, [
+            'get_stylesheet_href' => function ($tag) {
+                return $this->get_stylesheet_href_from_tag($tag);
             },
-            $html
-        );
+            'is_same_domain' => function ($href) {
+                return $this->is_same_domain($href);
+            },
+            'is_asset_excluded' => function ($url, $type) {
+                return $this->is_asset_excluded($url, $type);
+            },
+            'url_to_path' => function ($url) {
+                return $this->url_to_path($url);
+            },
+            'rewrite_css_urls_for_file' => function ($css, $href) {
+                return $this->rewrite_css_urls_for_file($css, $href);
+            },
+            'write_file_atomically' => function ($file, $contents) {
+                return $this->write_file_atomically($file, $contents);
+            },
+            'cache_dir' => $this->cache_dir,
+            'cache_url' => $this->cache_url,
+            'minify_css_enabled' => $this->setting_enabled('minify_css'),
+        ]);
     }
 
     private function combine_external_css_files($html) {
-        $groups = [];
-
-        $html = preg_replace_callback(
-            '/<link\b[^>]*>/i',
-            function ($m) use (&$groups) {
-                $tag = $m[0];
-                $href = $this->get_stylesheet_href_from_tag($tag);
-                if (!$href) {
-                    return $tag;
-                }
-
-                if (!$this->is_same_domain($href)) {
-                    return $tag;
-                }
-
-                if ($this->is_asset_excluded($href, 'css')) {
-                    return $tag;
-                }
-
-                $path = $this->url_to_path($href);
-                if (!$path || !file_exists($path) || !is_readable($path)) {
-                    return $tag;
-                }
-
-                $css = file_get_contents($path);
-                if ($css === false || $css === '') {
-                    return $tag;
-                }
-
-                $media = $this->parse_attr($tag, 'media');
-                $media = $media ? strtolower(trim($media)) : 'all';
-
-                $group_id = md5('css-' . $media);
-                if (!isset($groups[$group_id])) {
-                    $groups[$group_id] = [
-                        'media' => $media,
-                        'items' => [],
-                        'original_tags' => [],
-                    ];
-                }
-
-                $groups[$group_id]['items'][] = [
-                    'href' => $href,
-                    'css' => $this->rewrite_css_urls_for_file($css, $href),
-                ];
-                $groups[$group_id]['original_tags'][] = $tag;
-
-                return '<!--RSC_CSS_COMBINE:' . $group_id . '-->';
+        return $this->get_asset_combiner()->combine_external_css_files((string) $html, [
+            'get_stylesheet_href' => function ($tag) {
+                return $this->get_stylesheet_href_from_tag($tag);
             },
-            $html
-        );
-
-        if (empty($groups)) {
-            return $html;
-        }
-
-        $tags = [];
-        foreach ($groups as $group_id => $group) {
-            if (count($group['items']) < 2) {
-                $tags[$group_id] = $group['original_tags'][0];
-                continue;
-            }
-
-            $combined = '';
-            $fingerprint = '';
-            foreach ($group['items'] as $item) {
-                $chunk = $item['css'];
-                if ($this->setting_enabled('minify_css')) {
-                    $chunk = $this->minify_css($chunk);
-                }
-                $combined .= "\n" . $chunk;
-                $fingerprint .= $item['href'] . '|' . $chunk . ';';
-            }
-
-            $hash = md5($fingerprint);
-            $rel = 'css/combined-' . $hash . '.css';
-            $file = $this->cache_dir . $rel;
-            $url = $this->cache_url . $rel;
-
-            if (!file_exists($file)) {
-                $this->write_file_atomically($file, trim($combined));
-            }
-
-            $media_attr = ($group['media'] !== 'all' && $group['media'] !== '') ? ' media="' . esc_attr($group['media']) . '"' : '';
-            $tags[$group_id] = '<link rel="stylesheet" href="' . esc_url($url) . '"' . $media_attr . ' />';
-        }
-
-        $seen = [];
-        return preg_replace_callback(
-            '/<!--RSC_CSS_COMBINE:([a-f0-9]{32})-->/',
-            function ($m) use (&$seen, $tags) {
-                $id = $m[1];
-                if (!isset($tags[$id])) {
-                    return '';
-                }
-                if (isset($seen[$id])) {
-                    return '';
-                }
-                $seen[$id] = true;
-                return $tags[$id];
+            'is_same_domain' => function ($href) {
+                return $this->is_same_domain($href);
             },
-            $html
-        );
+            'is_asset_excluded' => function ($url, $type) {
+                return $this->is_asset_excluded($url, $type);
+            },
+            'url_to_path' => function ($url) {
+                return $this->url_to_path($url);
+            },
+            'rewrite_css_urls_for_file' => function ($css, $href) {
+                return $this->rewrite_css_urls_for_file($css, $href);
+            },
+            'write_file_atomically' => function ($file, $contents) {
+                return $this->write_file_atomically($file, $contents);
+            },
+            'parse_attr' => function ($tag, $attr) {
+                return $this->parse_attr($tag, $attr);
+            },
+            'minify_css' => function ($css) {
+                return $this->minify_css($css);
+            },
+            'cache_dir' => $this->cache_dir,
+            'cache_url' => $this->cache_url,
+            'minify_css_enabled' => $this->setting_enabled('minify_css'),
+        ]);
     }
 
     private function minify_external_js_files($html) {
-        return preg_replace_callback(
-            '/<script[^>]*src=["\']([^"\']+)["\'][^>]*>\s*<\/script>/i',
-            function ($m) {
-                $tag = $m[0];
-                $src = html_entity_decode($m[1]);
-
-                if (!$this->is_same_domain($src)) {
-                    return $tag;
-                }
-
-                if ($this->is_asset_excluded($src, 'js')) {
-                    return $tag;
-                }
-
-                $path = $this->url_to_path($src);
-                if (!$path || !file_exists($path) || !is_readable($path)) {
-                    return $tag;
-                }
-
-                $js = file_get_contents($path);
-                if ($js === false || $js === '') {
-                    return $tag;
-                }
-
-                $min = $this->setting_enabled('minify_js') ? $this->minify_js($js) : $js;
-                if ($min === '') {
-                    return $tag;
-                }
-
-                $hash = md5($src . '|' . $min);
-                $rel  = 'js/' . $hash . '.js';
-                $file = $this->cache_dir . $rel;
-                $url  = $this->cache_url . $rel;
-
-                if (!file_exists($file)) {
-                    $this->write_file_atomically($file, $min);
-                }
-
-                return preg_replace(
-                    '/src=["\'][^"\']+["\']/',
-                    'src="' . esc_url($url) . '"',
-                    $tag,
-                    1
-                );
+        return $this->get_minifier()->minify_external_js_files((string) $html, [
+            'is_same_domain' => function ($src) {
+                return $this->is_same_domain($src);
             },
-            $html
-        );
-    }
-
-    private function combine_script_region($region_html) {
-        $groups = [];
-        $group_index = 0;
-
-        $processed = preg_replace_callback(
-            '/<script[^>]*src=["\']([^"\']+)["\'][^>]*>\s*<\/script>/i',
-            function ($m) use (&$groups, &$group_index) {
-                $tag = $m[0];
-                $src = html_entity_decode($m[1]);
-
-                if (!$this->is_same_domain($src)) {
-                    return $tag;
-                }
-
-                if ($this->is_asset_excluded($src, 'js')) {
-                    return $tag;
-                }
-
-                if ($this->has_attr($tag, 'async') || $this->has_attr($tag, 'defer') || $this->has_attr($tag, 'nomodule')) {
-                    return $tag;
-                }
-
-                if ($this->is_module_script_tag($tag)) {
-                    return $tag;
-                }
-
-                if ($this->has_attr($tag, 'integrity') || $this->has_attr($tag, 'crossorigin')) {
-                    return $tag;
-                }
-
-                $path = $this->url_to_path($src);
-                if (!$path || !file_exists($path) || !is_readable($path)) {
-                    return $tag;
-                }
-
-                $js = file_get_contents($path);
-                if ($js === false || $js === '') {
-                    return $tag;
-                }
-
-                $group_id = 'js-' . $group_index;
-                $groups[$group_id][] = [
-                    'src' => $src,
-                    'js' => $js,
-                ];
-                $group_index++;
-
-                return '<!--RSC_JS_COMBINE:' . $group_id . '-->';
+            'is_asset_excluded' => function ($url, $type) {
+                return $this->is_asset_excluded($url, $type);
             },
-            $region_html
-        );
-
-        if (empty($groups) || count($groups) < 2) {
-            return $region_html;
-        }
-
-        $fingerprint = '';
-        $combined = '';
-
-        foreach ($groups as $items) {
-            foreach ($items as $item) {
-                $chunk = $item['js'];
-                if ($this->setting_enabled('minify_js')) {
-                    $chunk = $this->minify_js($chunk);
-                }
-                $combined .= "\n" . $chunk . ';';
-                $fingerprint .= $item['src'] . '|' . $chunk . ';';
-            }
-        }
-
-        $hash = md5($fingerprint);
-        $rel = 'js/combined-' . $hash . '.js';
-        $file = $this->cache_dir . $rel;
-        $url = $this->cache_url . $rel;
-
-        if (!file_exists($file)) {
-            $this->write_file_atomically($file, trim($combined));
-        }
-
-        $replacement = '<script src="' . esc_url($url) . '"></script>';
-        $used = false;
-
-        return preg_replace_callback(
-            '/<!--RSC_JS_COMBINE:js-\d+-->/',
-            function () use (&$used, $replacement) {
-                if ($used) {
-                    return '';
-                }
-                $used = true;
-                return $replacement;
+            'url_to_path' => function ($url) {
+                return $this->url_to_path($url);
             },
-            $processed
-        );
+            'write_file_atomically' => function ($file, $contents) {
+                return $this->write_file_atomically($file, $contents);
+            },
+            'cache_dir' => $this->cache_dir,
+            'cache_url' => $this->cache_url,
+            'minify_js_enabled' => $this->setting_enabled('minify_js'),
+        ]);
     }
 
     private function combine_external_js_files($html) {
-        $updated = $html;
-
-        if (preg_match('/<head\b[^>]*>(.*?)<\/head>/is', $updated, $head_match, PREG_OFFSET_CAPTURE)) {
-            $head_html = $head_match[1][0];
-            $head_pos = $head_match[1][1];
-            $new_head = $this->combine_script_region($head_html);
-            $updated = substr_replace($updated, $new_head, $head_pos, strlen($head_html));
-        }
-
-        if (preg_match('/<body\b[^>]*>(.*?)<\/body>/is', $updated, $body_match, PREG_OFFSET_CAPTURE)) {
-            $body_html = $body_match[1][0];
-            $body_pos = $body_match[1][1];
-            $new_body = $this->combine_script_region($body_html);
-            $updated = substr_replace($updated, $new_body, $body_pos, strlen($body_html));
-        }
-
-        return $updated;
+        return $this->get_asset_combiner()->combine_external_js_files((string) $html, [
+            'is_same_domain' => function ($src) {
+                return $this->is_same_domain($src);
+            },
+            'is_asset_excluded' => function ($url, $type) {
+                return $this->is_asset_excluded($url, $type);
+            },
+            'url_to_path' => function ($url) {
+                return $this->url_to_path($url);
+            },
+            'write_file_atomically' => function ($file, $contents) {
+                return $this->write_file_atomically($file, $contents);
+            },
+            'has_attr' => function ($tag, $attr) {
+                return $this->has_attr($tag, $attr);
+            },
+            'is_module_script_tag' => function ($tag) {
+                return $this->is_module_script_tag($tag);
+            },
+            'minify_js' => function ($js) {
+                return $this->minify_js($js);
+            },
+            'cache_dir' => $this->cache_dir,
+            'cache_url' => $this->cache_url,
+            'minify_js_enabled' => $this->setting_enabled('minify_js'),
+        ]);
     }
 
     private function minify_inline_css($html) {
-        if (!$this->setting_enabled('minify_css')) {
-            return $html;
-        }
-
-        return preg_replace_callback(
-            '/<style\b[^>]*>(.*?)<\/style>/is',
-            function ($m) {
-                $full = $m[0];
-                $inside = $m[1];
-                $min = $this->minify_css($inside);
-                return str_replace($inside, $min, $full);
-            },
-            $html
-        );
+        return $this->get_minifier()->minify_inline_css((string) $html, $this->setting_enabled('minify_css'));
     }
 
     private function minify_inline_js($html) {
-        if (!$this->setting_enabled('minify_js')) {
-            return $html;
-        }
-
-        return preg_replace_callback(
-            '/<script([^>]*)>(.*?)<\/script>/is',
-            function ($m) {
-                $attr = $m[1];
-                $content = $m[2];
-
-                if (stripos($attr, 'application/ld+json') !== false || stripos($attr, 'application/json') !== false) {
-                    return "<script{$attr}>{$content}</script>";
-                }
-
-                if (stripos($attr, 'src=') !== false) {
-                    return "<script{$attr}>{$content}</script>";
-                }
-
-                $min = $this->minify_js($content);
-
-                return "<script{$attr}>{$min}</script>";
-            },
-            $html
-        );
+        return $this->get_minifier()->minify_inline_js((string) $html, $this->setting_enabled('minify_js'));
     }
 
     private function defer_scripts($html) {
@@ -1783,23 +1649,24 @@ class ReallySimpleCache {
             return $html;
         }
 
-        return preg_replace_callback(
-            '/<script([^>]*)>/i',
-            function ($matches) {
-                $attr = $matches[1];
-
-                if (stripos($attr, 'application/ld+json') !== false || stripos($attr, 'application/json') !== false) {
-                    return "<script{$attr}>";
-                }
-
-                if (stripos($attr, 'defer') !== false || stripos($attr, 'async') !== false || $this->is_module_script_tag('<script' . $attr . '>')) {
-                    return "<script{$attr}>";
-                }
-
-                return "<script defer{$attr}>";
+        return $this->get_script_deferrer()->defer_html_scripts($html, [
+            'is_excluded' => function ($url, $type) {
+                return $this->is_asset_excluded($url, $type);
             },
-            $html
-        );
+        ]);
+    }
+
+    private function delay_scripts($html) {
+        if (!$this->setting_enabled('delay_scripts')) {
+            return $html;
+        }
+
+        return $this->get_script_delayer()->delay_html_scripts((string) $html, [
+            'is_excluded' => function ($url, $type) {
+                return $this->is_delay_script_excluded($url);
+            },
+            'delay_ms' => 3000,
+        ]);
     }
 
     public function process_output($html) {
@@ -1858,6 +1725,7 @@ class ReallySimpleCache {
         $html = $this->minify_inline_css($html);
         $html = $this->minify_inline_js($html);
         $html = $this->defer_scripts($html);
+        $html = $this->delay_scripts($html);
 
         if ($this->setting_enabled('minify_html')) {
             $html = $this->minify_html($html);
@@ -2151,6 +2019,13 @@ add_action('admin_bar_menu', function($admin_bar) {
             admin_url('admin-post.php?action=rsc_clear_page&url=' . urlencode($current_url)),
             'rsc_clear_page'
         ),
+    ]);
+
+    $admin_bar->add_node([
+        'id'     => 'rsc-settings',
+        'title'  => 'Settings',
+        'parent' => 'rsc-cache',
+        'href'   => admin_url('options-general.php?page=rsc-settings'),
     ]);
 }, 100);
 
