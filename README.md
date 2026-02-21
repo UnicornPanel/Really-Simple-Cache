@@ -8,7 +8,7 @@ A blazing-fast, lightweight, file-based cache plugin for WordPress designed to d
 
 No setup, no confusing options, no ads. Just enable and go.
 
-![Really Simple Cache](https://github.com/user-attachments/assets/5f52db53-c017-42d2-8570-55b850d12565)
+<img width="1223" height="2466" alt="Really Simple Cache for WordPress" src="https://github.com/user-attachments/assets/d82e7d13-1de9-443a-ad0d-387f9533c103" />
 
 ## ✨ Features
 
@@ -18,6 +18,10 @@ No setup, no confusing options, no ads. Just enable and go.
 - 🎯 **Host+scheme aware cache keys** to prevent cross-domain cache collisions  
 - 🧱 **Atomic cache writes** to reduce partial-file race conditions under load  
 - 🎛️ **Settings UI** under `Settings > RS Cache` with modern toggle controls  
+- 🧭 **WP Admin Toolbar shortcuts** under `Cache`:
+  - `Clear All`
+  - `Clear This Page`
+  - `Settings` (opens `Settings > RS Cache`)
 - 🔗 **Combine CSS Files** toggle  
 - 🔗 **Combine JS Files** toggle  
 - 👤 **Store Gravatar Avatars Locally** toggle  
@@ -58,6 +62,7 @@ That’s it! Caching begins immediately.
   - first request keeps remote font URLs
   - a background task downloads/localizes font CSS and font files
   - page cache is purged so future cached pages use local font URLs
+  - if a local font file exists but is past local TTL, the plugin checks remote `Last-Modified` and reuses the local file when the remote file is 7+ days old
 
 Font localization background processing uses WP-Cron.
 
@@ -75,6 +80,7 @@ Font localization background processing uses WP-Cron.
 - `Store Gravatar Avatars Locally`
 - `Store Bunny and Google Fonts Locally`
 - `Remote Asset TTL (seconds)` for avatar/font local cache refresh
+- For local font binaries, stale files may still be reused when origin `Last-Modified` is older than 7 days
 
 ## 📂 File Locations
 
