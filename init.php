@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Really Simple Cache
  * Description: Super lightweight output cache with HTML/CSS/JS minification and auto-defer scripts.
- * Version: 2.6
+ * Version: 2.6.1
  * Author: UnicornPanel.net
  */
 
@@ -1148,7 +1148,7 @@ class ReallySimpleCache {
             return '';
         }
 
-        if (strpos($url, 'data:') === 0 || strpos($url, '#') === 0) {
+        if (strpos($url, 'data:') === 0 || strpos($url, '#') === 0 || strpos($url, '%23') === 0) {
             return $url;
         }
 
